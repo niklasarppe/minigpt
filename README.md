@@ -15,4 +15,16 @@ The model is architecturally identical to Karpathy's nanoGPT — same pre-norm T
 - **Defensive mixed-precision handling.** Rather than assuming bf16/fp16 autocast works, the training loop probes the current device with a small matmul before committing to a dtype, and falls back to float32 if neither works — MPS support for this is inconsistent across PyTorch versions. This ended up being a big bottleneck.
 - **Gradient accumulation**, to allow a larger effective batch size than fits in memory at once on limited local hardware.
 
+## Differences to "the" Transformer
+
+On the left is the Transformer architecture from [Attention Is All You Need](https://arxiv.org/abs/1706.03762), and on the right is ours.
+
+Since this project follows GPT-2's architecture (via nanoGPT) rather than the original paper's, the main differences are:
+
+- **Decoder-only, no encoder.** The original paper describes an encoder-decoder architecture for sequence-to-sequence tasks (translation). This project keeps only the decoder stack, since it's trained purely as a language model.
+- **No cross-attention.** With no encoder, there's nothing for a decoder to attend to besides its own previous tokens — so each block has just one attention sublayer (causal self-attention) followed by the feed-forward sublayer, rather than the original's self-attention → cross-attention → feed-forward sequence.
+- **Pre-normalization instead of post-normalization.** LayerNorm is applied *before* each sublayer (attention or feed-forward) here, with the sublayer's output then added to the residual stream. The original paper normalizes *after* the residual addition. Pre-norm is the choice GPT-2 made for training stability at depth.
+- **Learned positional embeddings instead of fixed sinusoidal ones.** The original paper computes fixed sinusoidal position encodings. This project (like GPT-2) instead learns a position embedding table jointly with the rest of the model, at the cost of a hard maximum sequence length.
+- **GELU instead of ReLU** in the feed-forward sublayer. 
+
 ![Comparison between this project's transformer block and the original "Attention Is All You Need" architecture](figures/transformer_comparison.png)
