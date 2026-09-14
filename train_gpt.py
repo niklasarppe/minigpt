@@ -682,51 +682,6 @@ class DataLoaderLite:
 
 
 # -----------------------------------------------------------------------------
-# HellaSwag evaluation helper
-# -----------------------------------------------------------------------------
-
-
-def get_most_likely_row(token_ids, completion_mask, logits):
-    """Return the completion index with the lowest average completion loss."""
-
-    # Evaluate the autoregressive loss at every token position. The first logit
-    # predicts the second token, so logits and token IDs must be shifted by one.
-    shifted_logits = logits[..., :-1, :].contiguous()
-    shifted_token_ids = token_ids[..., 1:].contiguous()
-
-    flattened_logits = shifted_logits.view(-1, shifted_logits.size(-1))
-    flattened_token_ids = shifted_token_ids.view(-1)
-
-    token_losses = neural_network_functions.cross_entropy(
-        flattened_logits,
-        flattened_token_ids,
-        reduction="none",
-    )
-    token_losses = token_losses.view(token_ids.size(0), -1)
-
-    # Shift the mask for the same reason as the logits and token IDs: the loss
-    # at position i belongs to the token predicted at position i + 1.
-    shifted_completion_mask = completion_mask[..., 1:].contiguous()
-
-    # Keep losses only inside the completion region.
-    masked_token_losses = token_losses * shifted_completion_mask
-
-    # Average the completion loss independently for each candidate row.
-    total_completion_loss = masked_token_losses.sum(dim=1)
-    completion_token_count = shifted_completion_mask.sum(dim=1)
-
-    average_completion_loss = (
-        total_completion_loss / completion_token_count
-    )
-
-    # The completion with the lowest average negative log-likelihood is the
-    # model's most likely completion.
-    most_likely_completion_index = average_completion_loss.argmin().item()
-
-    return most_likely_completion_index
-
-
-# -----------------------------------------------------------------------------
 # Apple Silicon / device helpers
 # -----------------------------------------------------------------------------
 
