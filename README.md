@@ -4,16 +4,88 @@ This will be a GPT-2-style transformer, coded from scratch largely following And
 
 This is not trying to be something fancy, but merely a way for me to force myself to learn to inner workings of transformers.
 
-> **Status: on hold.** Training this locally on my M4 MacBook Air turned out to be impractical — no CUDA support, inconsistent/unavailable mixed-precision support on MPS, and throughput too low to iterate on anything beyond toy runs. Picking this back up will likely mean moving training off local hardware first.
+
+## Sample output
+
+After being trained on the tiny shakespeare dataset for 30 minutes, or around 4000 steps (and with batch size etc. as in the file), our model achieves a training loss of around 1.46, but a poor validation loss of 6.81. In other words, the model is overfitting to the dataset.
+
+![training loss chart](figures/training_loss.png)
+
+
+
+With this setup and being prompted with "Oh, Romeo," our model returns:
+
+```
+Oh Romeo, he's lord, and on him;
+With five thousand times won.
+
+Romeoure men.
+
+QUEEN ELIZABETH:
+What else? peace--
+
+KING RICHMOND with a horse!
+
+QUEEN ELIZABETH:
+Wash thou and his own wrath, in his love, in their lives, in our arms,
+I do forefo,
+That we are butcher'd a king, that black, life.
+
+KING RICHARD III:
+Why should I'll no other beauties.
+
+KING RICHMakes me the field.
+QUEEN ELIZABETH:
+But you do good my son Edward still infect another.
+
+KING RICHARD III:
+My gracious sovereign account of heaven! there the town of Clarence, what is spake in France;
+When come and the land, what, so, true, this your grace is.
+
+MONTAGUEEN ELIZABETH:
+What's hand, that will our cousin, when I'll inform'd
+For nothing else you do you homely and tell him of patience
+And thus I'll frighted with our side, to-morrow, my soul!
+
+KING RICHARD III, and sovereign, for a king,
+And hate I amends that hath twenty winters out:
+Look, and bring me the king, what with a-morrow 'larhips?
+He is your grace for we are!
+RIVERS:
+O God! a-day?
+
+DUCHESS OF YORK:
+O my lord, then, then, for loss of any be.
+
+Tis love, what rests me, or be brief,
+QUEEN ELIZABETH:
+On what services are all's lords, as you.
+
+QUEEN ELIZABETH:
+I do not be thus?
+
+KING RICHARD III:
+'Twere trinicious way.
+
+ARCHBISHOP OF YORK:
+'re you both, gentle words as part of you,
+Even so?  what is, and being thus I have spent,
+But I be tempted me the people.
+
+DUCHESS OF YORK:
+Alas I be patient: why, that, good for you had said,
+An I have wrought us no;
+And so we
+```
 
 ## Changes to nanoGPT
 
-The model is architecturally identical to Karpathy's nanoGPT — same pre-norm Transformer blocks, causal self-attention via `scaled_dot_product_attention`, GELU-based MLP, and weight tying between the token embedding and the output head. The differences are:
+The model is architecturally identical to Karpathy's nanoGPT: same pre-norm Transformer blocks, causal self-attention via `scaled_dot_product_attention`, GELU-based MLP, and weight tying between the token embedding and the output head. The differences are:
 
 - **Fully spelled-out naming.** Every module, variable, and config field uses a descriptive name instead of nanoGPT's compact ones (`c_attn` → `query_key_value_projection`, `wte`/`wpe` → `token_embedding_table`/`position_embedding_table`, `n_embd` → `embedding_dimension`, etc.). The point of this project is to force myself to actually understand each piece, so I optimized the code for reading over terseness.
 - **Apple Silicon support alongside CUDA.** Added `get_device()` and `synchronize_device()` helpers so the same training loop runs on MPS, CUDA, or CPU, since I'm developing on an M4 Air rather than an Nvidia GPU.
-- **Defensive mixed-precision handling.** Rather than assuming bf16/fp16 autocast works, the training loop probes the current device with a small matmul before committing to a dtype, and falls back to float32 if neither works — MPS support for this is inconsistent across PyTorch versions. This ended up being a big bottleneck.
-- **Gradient accumulation**, to allow a larger effective batch size than fits in memory at once on limited local hardware.
+- **Defensive mixed-precision handling.** Rather than assuming bf16/fp16 autocast works, the training loop probes the current device with a small matmul before committing to a dtype, and falls back to float32 if neither works — MPS support for this is inconsistent across PyTorch versions. This ended up being a big bottleneck as MPS doesn't support bf16. I could have tried running it on the CPU with bf16, but I still think this would perform worse.
+
 
 ## Differences to "the" Transformer
 

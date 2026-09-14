@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import tiktoken
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as neural_network
 from torch.nn import functional as neural_network_functions
@@ -600,44 +601,55 @@ def load_tokens(filename):
 
 
 class DataLoaderLite:
-    """Serve consecutive next-token batches from Tiny Shakespeare."""
+    """Serve consecutive next-token batches from a tokenized text split."""
 
-    def __init__(self, batch_size, sequence_length):
+    def __init__(
+        self,
+        batch_size,
+        sequence_length,
+        split="train",
+        validation_fraction=0.1,
+    ):
         self.batch_size = batch_size
         self.sequence_length = sequence_length
+        self.split = split
 
-        input_file_path = (
-            Path(__file__).parent
-            / "data"
-            / "tinyshakespeare"
-            / "input.txt"
-        )
-
+        input_file_path = Path(__file__).parent / "data" / "input.txt"
         encoder = tiktoken.get_encoding("gpt2")
 
-        # Store the complete tokenized corpus once. `torch.from_numpy` avoids an
-        # unnecessary intermediate tensor copy compared with torch.tensor.
+        text = input_file_path.read_text(encoding="utf-8")
         encoded_tokens = np.asarray(
-            encoder.encode(input_file_path.read_text()),
+            encoder.encode(text),
             dtype=np.int64,
         )
-        self.tokens = torch.from_numpy(encoded_tokens)
+        all_tokens = torch.from_numpy(encoded_tokens)
+
+        split_index = int(all_tokens.numel() * (1.0 - validation_fraction))
+        split_index = max(1, min(split_index, all_tokens.numel() - 1))
+
+        if split == "train":
+            self.tokens = all_tokens[:split_index]
+        elif split in {"val", "validation"}:
+            self.tokens = all_tokens[split_index:]
+        else:
+            raise ValueError("split must be 'train' or 'val'")
 
         minimum_required_tokens = batch_size * sequence_length + 1
         assert self.tokens.numel() >= minimum_required_tokens, (
-            "The dataset is too small for one batch. Reduce batch_size or "
-            "sequence_length."
+            f"The {split} split has only {self.tokens.numel()} tokens, but "
+            f"{minimum_required_tokens} are required. Reduce batch_size or "
+            f"sequence_length."
         )
 
         print(
-            f"loaded {self.tokens.numel()} tokens from "
+            f"loaded {self.tokens.numel():,} {split} tokens from "
             f"{input_file_path.name}"
         )
 
         self.reset()
 
     def reset(self):
-        """Start reading the corpus again from its first token."""
+        """Start reading the current split again from its first token."""
         self.current_position = 0
 
     def next_batch(self):
@@ -786,147 +798,284 @@ def probe_supported_mixed_precision_dtype(device, preferred_dtype=torch.bfloat16
 # -----------------------------------------------------------------------------
 
 
+@torch.no_grad()
+def evaluate_loss(model, data_loader, device, number_of_batches=20):
+    """Estimate average loss on a data split without changing model weights."""
+    was_training = model.training
+    model.eval()
+
+    total_loss = 0.0
+
+    for _ in range(number_of_batches):
+        input_token_ids, target_token_ids = data_loader.next_batch()
+        input_token_ids = input_token_ids.to(device)
+        target_token_ids = target_token_ids.to(device)
+
+        _, loss = model(input_token_ids, target_token_ids)
+        total_loss += loss.item()
+
+    if was_training:
+        model.train()
+
+    return total_loss / number_of_batches
+
+
+def plot_losses(
+    train_losses,
+    validation_steps,
+    validation_losses,
+    output_path="training_loss.png",
+):
+    """Save a graph showing training and validation loss over time."""
+    plt.figure(figsize=(10, 5))
+    plt.plot(
+        range(1, len(train_losses) + 1),
+        train_losses,
+        label="Training loss",
+    )
+
+    if validation_losses:
+        plt.plot(
+            validation_steps,
+            validation_losses,
+            marker="o",
+            label="Validation loss",
+        )
+
+    plt.xlabel("Training step")
+    plt.ylabel("Cross-entropy loss")
+    plt.title("Tiny Shakespeare training")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.show()
+
+
+@torch.no_grad()
+def generate_text(
+    model,
+    prompt,
+    max_new_tokens=300,
+    temperature=0.8,
+    top_k=50,
+):
+    """Generate text autoregressively from a prompt."""
+    if temperature <= 0:
+        raise ValueError("temperature must be greater than zero")
+
+    device = next(model.parameters()).device
+    encoder = tiktoken.get_encoding("gpt2")
+
+    token_ids = encoder.encode(prompt)
+    if not token_ids:
+        raise ValueError("prompt must contain at least one token")
+
+    input_ids = torch.tensor(
+        token_ids,
+        dtype=torch.long,
+        device=device,
+    ).unsqueeze(0)
+
+    model.eval()
+
+    for _ in range(max_new_tokens):
+        context = input_ids[:, -model.config.context_window_size:]
+
+        logits, _ = model(context)
+        logits = logits[:, -1, :]
+        logits = logits / temperature
+
+        if top_k is not None:
+            top_k = min(top_k, logits.size(-1))
+            values, _ = torch.topk(logits, top_k)
+            logits[logits < values[:, [-1]]] = float("-inf")
+
+        probabilities = torch.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probabilities, num_samples=1)
+
+        input_ids = torch.cat([input_ids, next_token], dim=1)
+
+    return encoder.decode(input_ids[0].tolist())
+
+
+
 def train(
-    number_of_training_steps=50,
+    training_minutes=30,
     batch_size=8,
     sequence_length=256,
     learning_rate=3e-4,
     weight_decay=0.1,
-    use_mixed_precision=False,
-    use_torch_compile=False,
     gradient_accumulation_steps=2,
+    validation_fraction=0.1,
+    validation_interval=100,
+    validation_batches=20,
 ):
-    """Train GPT locally with device-aware settings.
- 
-    The model architecture remains unchanged. MPS mixed precision and
-    torch.compile are opt-in because support and performance can vary between
-    PyTorch and macOS versions.
- 
-    `gradient_accumulation_steps` lets you simulate a larger batch size than
-    fits in memory at once: `gradient_accumulation_steps` micro-batches of
-    size `batch_size` are averaged together before each optimizer step, so
-    the effective batch size is `batch_size * gradient_accumulation_steps`.
-    """
+    """Train the small GPT model on Tiny Shakespeare for a fixed amount of time."""
     device = get_device()
     device_type = device.type
- 
+
     print(f"using device: {device}")
- 
-    # Reproducible initialization. CUDA has its own random-number generator;
-    # MPS uses PyTorch's general generator.
+
     torch.manual_seed(1337)
- 
+
     if device_type == "cuda":
         torch.cuda.manual_seed(1337)
- 
-    # This can improve matrix multiplication performance without changing the
-    # model's architecture. It is especially useful for larger matrix products.
+
     torch.set_float32_matmul_precision("high")
- 
+
     train_loader = DataLoaderLite(
         batch_size=batch_size,
         sequence_length=sequence_length,
+        split="train",
+        validation_fraction=validation_fraction,
     )
- 
-    model = GPT(GPTConfig()).to(device)
- 
-    # Keep float32 as the stable default. When mixed precision is requested,
-    # probe which autocast dtype this specific device/PyTorch combination
-    # actually supports rather than assuming bfloat16 or float16 will work.
-    mixed_precision_dtype = None
-    if use_mixed_precision:
-        if device_type in {"mps", "cuda"}:
-            mixed_precision_dtype = probe_supported_mixed_precision_dtype(device)
-            if mixed_precision_dtype is not None:
-                print(f"using {mixed_precision_dtype} mixed precision via autocast")
-        else:
-            print("mixed precision requested, but CPU training remains float32")
- 
-    if use_torch_compile:
-        # Compilation is deliberately optional: MPS support can vary by PyTorch
-        # release, and for a small local model the compilation overhead may
-        # outweigh the speedup.
-        print("compiling model with torch.compile...")
-        model = torch.compile(model)
- 
+
+    validation_loader = DataLoaderLite(
+        batch_size=batch_size,
+        sequence_length=sequence_length,
+        split="val",
+        validation_fraction=validation_fraction,
+    )
+
+    # Small enough to train locally, but large enough to learn Shakespeare's
+    # character/dialogue patterns reasonably well.
+    model = GPT(
+        GPTConfig(
+            context_window_size=sequence_length,
+            vocabulary_size=50257,
+            number_of_transformer_blocks=4,
+            number_of_attention_heads=4,
+            embedding_dimension=256,
+        )
+    ).to(device)
+
+    number_of_parameters = sum(
+        parameter.numel() for parameter in model.parameters()
+    )
+    print(f"model parameters: {number_of_parameters:,}")
+
     optimizer = model.configure_optimizers(
         weight_decay=weight_decay,
         learning_rate=learning_rate,
         device_type=device_type,
     )
- 
+
+    train_losses = []
+    validation_steps = []
+    validation_losses = []
+
+    # The requested duration is a target, not an exact guarantee. The loop
+    # finishes the current optimizer step before stopping.
+    end_time = time.perf_counter() + training_minutes * 60
+    training_step = 0
+
     model.train()
- 
-    for training_step in range(number_of_training_steps):
+
+    while time.perf_counter() < end_time:
+        training_step += 1
         step_start_time = time.perf_counter()
- 
+
         optimizer.zero_grad(set_to_none=True)
- 
-        # Accumulate gradients over several micro-batches before stepping the
-        # optimizer, so the effective batch size is larger than what fits in
-        # memory at once. Each micro-batch's loss is divided by the number of
-        # accumulation steps so the accumulated gradient matches what a single
-        # large batch would have produced.
-        #
-        # The running loss is kept as a device tensor and only pulled to the
-        # CPU once, after the loop. Calling `.item()` inside the loop would
-        # force a GPU/CPU sync on every micro-batch, serializing work that
-        # would otherwise pipeline - this matters even more on MPS than CUDA,
-        # since per-sync overhead tends to be higher there.
         accumulated_loss = torch.zeros((), device=device)
- 
+
         for _ in range(gradient_accumulation_steps):
             input_token_ids, target_token_ids = train_loader.next_batch()
- 
+
             input_token_ids = input_token_ids.to(device)
             target_token_ids = target_token_ids.to(device)
- 
-            if mixed_precision_dtype is not None:
-                with torch.autocast(
-                    device_type=device_type,
-                    dtype=mixed_precision_dtype,
-                ):
-                    vocabulary_logits, micro_batch_loss = model(
-                        input_token_ids,
-                        target_token_ids,
-                    )
-            else:
-                vocabulary_logits, micro_batch_loss = model(
-                    input_token_ids,
-                    target_token_ids,
-                )
- 
-            scaled_loss = micro_batch_loss / gradient_accumulation_steps
-            scaled_loss.backward()
-            accumulated_loss += micro_batch_loss.detach() / gradient_accumulation_steps
- 
+
+            _, micro_batch_loss = model(
+                input_token_ids,
+                target_token_ids,
+            )
+
+            (micro_batch_loss / gradient_accumulation_steps).backward()
+
+            accumulated_loss += (
+                micro_batch_loss.detach() / gradient_accumulation_steps
+            )
+
         optimizer.step()
- 
-        # MPS and CUDA execute operations asynchronously, so synchronize before
-        # measuring elapsed time or reading the loss back to the CPU. CPU
-        # execution needs no explicit synchronization.
+
         synchronize_device(device)
-        accumulated_loss = accumulated_loss.item()
- 
-        step_end_time = time.perf_counter()
-        step_duration_seconds = step_end_time - step_start_time
- 
+
+        train_loss = accumulated_loss.item()
+        train_losses.append(train_loss)
+
+        step_duration_seconds = time.perf_counter() - step_start_time
+
         processed_tokens = (
-            train_loader.batch_size
-            * train_loader.sequence_length
+            batch_size
+            * sequence_length
             * gradient_accumulation_steps
         )
         tokens_per_second = processed_tokens / step_duration_seconds
- 
-        print(
-            f"step {training_step:04d}, "
-            f"loss: {accumulated_loss:.6f}, "
-            f"dt: {step_duration_seconds * 1000:.2f}ms, "
-            f"tok/sec: {tokens_per_second:.2f}"
-        )
- 
+
+        if (
+            training_step == 1
+            or training_step % validation_interval == 0
+        ):
+            validation_loss = evaluate_loss(
+                model,
+                validation_loader,
+                device,
+                number_of_batches=validation_batches,
+            )
+            validation_steps.append(training_step)
+            validation_losses.append(validation_loss)
+
+            elapsed_minutes = (
+                (time.perf_counter() + training_minutes * 60 - end_time)
+                / 60
+            )
+
+            print(
+                f"step {training_step:04d} | "
+                f"train loss {train_loss:.4f} | "
+                f"val loss {validation_loss:.4f} | "
+                f"{tokens_per_second:.0f} tok/s | "
+                f"{elapsed_minutes:.1f} min"
+            )
+        else:
+            print(
+                f"step {training_step:04d} | "
+                f"loss {train_loss:.4f} | "
+                f"{tokens_per_second:.0f} tok/s"
+            )
+
+    print(f"\ntraining finished after {training_step} steps")
+
+    plot_losses(
+        train_losses,
+        validation_steps,
+        validation_losses,
+        output_path="training_loss.png",
+    )
+
     return model
- 
- 
+
+
 if __name__ == "__main__":
-    train()
+    model = train(
+        training_minutes=30,
+        batch_size=8,
+        sequence_length=256,
+        learning_rate=3e-4,
+        gradient_accumulation_steps=2,
+        validation_interval=100,
+        validation_batches=20,
+    )
+
+    generated_text = generate_text(
+        model,
+        prompt="Oh Romeo,",
+        max_new_tokens=500,
+        temperature=0.8,
+        top_k=50,
+    )
+
+    print("\n" + "=" * 80)
+    print("GENERATED TEXT")
+    print("=" * 80)
+    print(generated_text)
