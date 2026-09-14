@@ -7,7 +7,7 @@ This is not trying to be something fancy, but merely a way for me to force mysel
 
 ## Sample output
 
-After being trained on the tiny shakespeare dataset for 30 minutes, or around 4000 steps (and with batch size etc. as in the file), our model achieves a training loss of around 1.46, but a poor validation loss of 6.81. In other words, the model is overfitting to the dataset.
+After being trained on the tiny shakespeare dataset for 30 minutes, or around 4000 steps (and with batch size etc. as in the file), our model achieves a training loss of around 1.46, but a poor validation loss of 6.81. In other words, the model is overfitting to the dataset – I'm sure this could have been dealt with by an expert, even with my very limited hardware. 
 
 ![training loss chart](figures/training_loss.png)
 
